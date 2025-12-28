@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+build/
+dist/
+
+# Virtual environments
+.venv/
+.venv.bak/
+.venv*/
+.env
+.env.*
+.python-version
+
+# IDEs
+.idea/
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Capture outputs
+*.log
+*.mjpg
+*.raw
+*.yuv
