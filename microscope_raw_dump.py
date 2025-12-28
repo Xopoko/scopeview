@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Capture raw frames from the MikrOkularHD (or any V4L2 device) without colour
+Capture raw frames from the MikrOkularHD (or any capture device) without color
 conversion and dump them to disk/stdout along with optional metadata.
 """
 from __future__ import annotations
@@ -14,23 +14,22 @@ from typing import BinaryIO, Iterator
 
 import cv2
 
-
-def find_device(preferred_name: str) -> str | int:
-    by_id_dir = Path("/dev/v4l/by-id")
-    if by_id_dir.is_dir():
-        for entry in by_id_dir.iterdir():
-            if preferred_name.lower() in entry.name.lower():
-                return str(entry.resolve())
-    return 0
+from microscope_capture import open_pygrabber_capture
+from microscope_devices import format_device_list, list_devices, resolve_device
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Dump raw frames from a V4L2 device (no colour conversion)."
+        description="Dump raw frames from a capture device (no color conversion)."
     )
     parser.add_argument(
         "--device",
-        help="Path or index of the V4L2 device (default: auto-detected MikrOkularHD).",
+        help="Device index or name substring (default: auto-detected).",
+    )
+    parser.add_argument(
+        "--list-devices",
+        action="store_true",
+        help="List available capture devices and exit.",
     )
     parser.add_argument(
         "--width",
@@ -51,6 +50,12 @@ def parse_args() -> argparse.Namespace:
         "--fourcc",
         default="YUYV",
         help="Desired pixel format (e.g., YUYV, MJPG). Use 'auto' to skip forcing.",
+    )
+    parser.add_argument(
+        "--capture-backend",
+        choices=("auto", "dshow", "msmf", "v4l2", "pygrabber"),
+        default="auto",
+        help="Capture backend (default: auto). Use dshow/msmf/pygrabber on Windows, v4l2 on Linux.",
     )
     parser.add_argument(
         "--frames",
@@ -102,11 +107,83 @@ def output_stream(path: str) -> Iterator[BinaryIO]:
 def main() -> int:
     args = parse_args()
 
-    device = args.device if args.device is not None else find_device("MikrOkularHD")
-    cap = cv2.VideoCapture(device, cv2.CAP_V4L2)
-    if not cap.isOpened():
+    if args.list_devices:
+        try:
+            devices = list_devices()
+        except RuntimeError as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
+        print(format_device_list(devices))
+        return 0
+
+    try:
+        device, devices = resolve_device(args.device, "MikrOkularHD")
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+
+    backend_map: dict[str, int | None] = {
+        "dshow": cv2.CAP_DSHOW,
+        "msmf": cv2.CAP_MSMF,
+        "v4l2": cv2.CAP_V4L2,
+        "any": cv2.CAP_ANY,
+        "pygrabber": None,
+    }
+    if args.capture_backend == "auto":
+        if sys.platform.startswith("win"):
+            backend_candidates = [
+                ("dshow", backend_map["dshow"]),
+                ("msmf", backend_map["msmf"]),
+                ("any", backend_map["any"]),
+                ("pygrabber", backend_map["pygrabber"]),
+            ]
+        else:
+            backend_candidates = [
+                ("v4l2", backend_map["v4l2"]),
+                ("any", backend_map["any"]),
+            ]
+    else:
+        backend_candidates = [(args.capture_backend, backend_map[args.capture_backend])]
+
+    device_name = None
+    if sys.platform.startswith("win") and isinstance(device, int):
+        if 0 <= device < len(devices):
+            device_name = devices[device]
+
+    cap = None
+    pending_frame = None
+    for backend_label, backend in backend_candidates:
+        if backend_label == "pygrabber":
+            if not isinstance(device, int):
+                if not args.silent:
+                    print("pygrabber requires a numeric device index.")
+                continue
+            if not args.silent:
+                print("Attempting to open using pygrabber backend...")
+            cap, pending_frame = open_pygrabber_capture(device, args)
+            if cap is not None:
+                break
+            continue
+
+        if backend is None:
+            continue
+
+        cap = cv2.VideoCapture(device, backend)
+        if not cap.isOpened() and device_name:
+            name_source = f"video={device_name}"
+            if not args.silent:
+                print(f"Retrying by name: {name_source}")
+            cap.release()
+            cap = cv2.VideoCapture(name_source, backend)
+        if cap.isOpened():
+            break
+        if not args.silent:
+            print(f"Unable to open device using {backend_label} backend.")
+
+    if cap is None or not cap.isOpened():
         print(
-            "Failed to open the camera. Use --device to specify the /dev/video* path.",
+            "Failed to open the camera. Use --list-devices or --device to select a camera, "
+            "and try --capture-backend (dshow/msmf) if needed.",
             file=sys.stderr,
         )
         return 1
@@ -131,7 +208,11 @@ def main() -> int:
 
     with output_stream(args.output) as out:
         for idx in range(args.frames):
-            ok, frame = cap.read()
+            if pending_frame is not None:
+                ok, frame = True, pending_frame
+                pending_frame = None
+            else:
+                ok, frame = cap.read()
             if not ok:
                 print("Failed to read frame from camera.", file=sys.stderr)
                 return 3

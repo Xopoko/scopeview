@@ -1,36 +1,30 @@
 #!/usr/bin/env python3
 """
-Microscope camera viewer for the MikrOkularHD USB camera (or other V4L2 devices).
+ScopeView: microscope camera viewer for the MikrOkularHD USB camera (or other capture devices).
 
-The script tries to resolve the matching /dev/video* device automatically via
-/dev/v4l/by-id. Override with --device if necessary.
+On Windows, the script can match devices by DirectShow name. Use --device to
+override the selected index or name substring when needed.
 """
 from __future__ import annotations
 
 import os
-os.environ.setdefault("QT_QPA_PLATFORM", "xcb")
-os.environ.setdefault("SDL_VIDEODRIVER", "x11")
+import sys
+
+if sys.platform.startswith("linux"):
+    os.environ.setdefault("QT_QPA_PLATFORM", "xcb")
+    os.environ.setdefault("SDL_VIDEODRIVER", "x11")
 
 import argparse
-import sys
 import time
-from pathlib import Path
 from typing import Any
 
 import cv2
 import numpy as np
 
+from microscope_capture import open_pygrabber_capture
+from microscope_devices import format_device_list, list_devices, resolve_device
+
 FrameType = Any
-
-
-def find_device(preferred_name: str) -> str | int:
-    """Return a /dev/video path (or 0) matching the preferred device name."""
-    by_id_dir = Path("/dev/v4l/by-id")
-    if by_id_dir.is_dir():
-        for entry in by_id_dir.iterdir():
-            if preferred_name.lower() in entry.name.lower():
-                return str(entry.resolve())
-    return 0
 
 
 def normalize_fourcc(value: str | None) -> str | None:
@@ -60,7 +54,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--device",
-        help="Path or index of the V4L2 device (default: auto-detected).",
+        help="Device index or name substring (default: auto-detected).",
+    )
+    parser.add_argument(
+        "--list-devices",
+        action="store_true",
+        help="List available capture devices and exit.",
     )
     parser.add_argument(
         "--width",
@@ -79,7 +78,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--window-title",
-        default="Microscope Live View",
+        default="ScopeView Live",
         help="Title for the preview window.",
     )
     parser.add_argument(
@@ -111,6 +110,12 @@ def parse_args() -> argparse.Namespace:
         choices=("opencv", "pygame"),
         default="pygame",
         help="Select the display backend (default: pygame).",
+    )
+    parser.add_argument(
+        "--capture-backend",
+        choices=("auto", "dshow", "msmf", "v4l2", "pygrabber"),
+        default="auto",
+        help="Capture backend (default: auto). Use dshow/msmf/pygrabber on Windows, v4l2 on Linux.",
     )
     parser.add_argument(
         "--fourcc",
@@ -224,14 +229,25 @@ def prime_capture(
 
 def acquire_capture(
     device: str | int,
+    device_name: str | None,
     args: argparse.Namespace,
     fourcc_candidates: list[str | None],
-) -> tuple[cv2.VideoCapture | None, str | None, FrameType | None]:
+    backend: int,
+    backend_label: str,
+) -> tuple[Any | None, str | None, FrameType | None]:
     """Try to open the capture device using the supplied FOURCC candidates."""
     for fourcc in fourcc_candidates:
         label = fourcc or "driver default"
-        print(f"Attempting to open {device} using pixel format '{label}'...")
-        capture = cv2.VideoCapture(device, cv2.CAP_V4L2)
+        print(
+            f"Attempting to open {device} using {backend_label} backend, "
+            f"pixel format '{label}'..."
+        )
+        capture = cv2.VideoCapture(device, backend)
+        if not capture.isOpened() and device_name:
+            name_source = f"video={device_name}"
+            print(f"  -> retrying by name: {name_source}")
+            capture.release()
+            capture = cv2.VideoCapture(name_source, backend)
         if not capture.isOpened():
             print("  -> unable to open device with this setting.")
             continue
@@ -244,6 +260,47 @@ def acquire_capture(
         report_stream_state(capture)
         return capture, fourcc, first_frame
     return None, None, None
+
+
+def open_with_backends(
+    device: str | int,
+    device_name: str | None,
+    args: argparse.Namespace,
+    fourcc_candidates: list[str | None],
+    backend_candidates: list[tuple[str, int | None]],
+) -> tuple[
+    Any | None,
+    str | None,
+    FrameType | None,
+    str | None,
+    int | None,
+]:
+    for backend_label, backend in backend_candidates:
+        if backend_label == "pygrabber":
+            print(f"Attempting to open {device} using pygrabber backend...")
+            if not isinstance(device, int):
+                print("  -> pygrabber requires a numeric device index.")
+                continue
+            capture, pending_frame = open_pygrabber_capture(device, args)
+            if capture is not None:
+                report_stream_state(capture)
+                return capture, None, pending_frame, backend_label, backend
+            continue
+
+        if backend is None:
+            continue
+
+        capture, active_fourcc, pending_frame = acquire_capture(
+            device,
+            device_name,
+            args,
+            fourcc_candidates,
+            backend,
+            backend_label,
+        )
+        if capture is not None:
+            return capture, active_fourcc, pending_frame, backend_label, backend
+    return None, None, None, None, None
 
 
 def prepare_display(
@@ -340,15 +397,60 @@ def shutdown_display(ctx: dict[str, Any], args: argparse.Namespace) -> None:
 def main() -> int:
     args = parse_args()
 
-    device = args.device if args.device is not None else find_device("MikrOkularHD")
+    if args.list_devices:
+        try:
+            devices = list_devices()
+        except RuntimeError as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
+        print(format_device_list(devices))
+        return 0
+
+    try:
+        device, devices = resolve_device(args.device, "MikrOkularHD")
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+
+    backend_map: dict[str, int | None] = {
+        "dshow": cv2.CAP_DSHOW,
+        "msmf": cv2.CAP_MSMF,
+        "v4l2": cv2.CAP_V4L2,
+        "any": cv2.CAP_ANY,
+        "pygrabber": None,
+    }
+    if args.capture_backend == "auto":
+        if sys.platform.startswith("win"):
+            backend_candidates = [
+                ("dshow", backend_map["dshow"]),
+                ("msmf", backend_map["msmf"]),
+                ("any", backend_map["any"]),
+                ("pygrabber", backend_map["pygrabber"]),
+            ]
+        else:
+            backend_candidates = [
+                ("v4l2", backend_map["v4l2"]),
+                ("any", backend_map["any"]),
+            ]
+    else:
+        backend_candidates = [(args.capture_backend, backend_map[args.capture_backend])]
+
+    device_name = None
+    if sys.platform.startswith("win") and isinstance(device, int):
+        if 0 <= device < len(devices):
+            device_name = devices[device]
+
     fourcc_candidates = build_fourcc_candidates(args)
     print(f"Opening camera device: {device}")
-    capture, active_fourcc, pending_frame = acquire_capture(device, args, fourcc_candidates)
+    capture, _active_fourcc, pending_frame, active_backend_label, active_backend = open_with_backends(
+        device, device_name, args, fourcc_candidates, backend_candidates
+    )
 
     if capture is None:
         print(
             "Failed to open the camera. "
-            "Use --device to specify the correct /dev/video* path or adjust --fourcc/--width.",
+            "Use --list-devices or --device to select a camera, "
+            "and try --capture-backend (dshow/msmf) if needed.",
             file=sys.stderr,
         )
         return 1
@@ -381,8 +483,15 @@ def main() -> int:
                 print("Lost camera signal, attempting to reopen...", file=sys.stderr)
                 capture.release()
                 time.sleep(args.retry_delay)
-                capture, active_fourcc, pending_frame = acquire_capture(
-                    device, args, fourcc_candidates
+                reconnect_candidates = backend_candidates
+                if active_backend_label and active_backend is not None:
+                    reconnect_candidates = [(active_backend_label, active_backend)] + [
+                        (label, backend)
+                        for label, backend in backend_candidates
+                        if (label, backend) != (active_backend_label, active_backend)
+                    ]
+                capture, _active_fourcc, pending_frame, active_backend_label, active_backend = open_with_backends(
+                    device, device_name, args, fourcc_candidates, reconnect_candidates
                 )
                 if capture is None:
                     print(

@@ -1,91 +1,68 @@
-# WSL Microscope Viewer
+# ScopeView
 
-Live viewer and raw capture utilities for the **MikrOkularHD** USB microscope (or any V4L2 camera) on WSL2/Linux. Uses OpenCV for capture with pygame (default) or OpenCV windows for display.
+ScopeView is a live viewer and raw capture toolkit for the **MikrOkularHD** USB microscope (or any DirectShow-compatible camera) on Windows 10/11. Uses OpenCV for capture with pygame (default) or OpenCV windows for display.
 
-![WSL Microscope Viewer preview](docs/screenshot.svg)
+![ScopeView preview](docs/screenshot.png)
 
 _The preview image is illustrative. Replace it with a real capture from your device if you want a true screenshot._
 
 ## Features
 
-- Auto-detects MikrOkularHD via `/dev/v4l/by-id` with a manual `--device` override.
+- Auto-detects MikrOkularHD by name (with a manual `--device` override).
+- DirectShow device listing via `--list-devices`.
 - Selectable display backend (pygame default, OpenCV optional).
 - Configurable resolution/FPS plus FOURCC fallback handling.
 - Raw frame dump CLI with optional JSON metadata.
 
 ## Requirements
 
-- Windows 10/11 with **WSLg** (or another X/Wayland server) for GUI output.
-- WSL2 kernel with UVC support (tested on `6.6.87.2-microsoft-standard-WSL2`).
-- [`usbipd-win`](https://github.com/dorssel/usbipd-win/releases/latest) installed on the Windows host.
-- Python 3.9+ in WSL.
+- Windows 10/11.
+- Python 3.9+.
+- A USB microscope or camera connected to the PC.
 
-## Quick start (WSL2)
+## Quick start (Windows)
 
-```bash
-sudo apt update
-sudo apt install -y python3-venv usbutils v4l-utils linux-tools-virtual linux-cloud-tools-virtual
-
-python3 -m venv .venv
-. .venv/bin/activate
-pip install --upgrade pip
-pip install -r requirements.txt
-
-# Allow your user to access /dev/video*
-sudo usermod -aG video "$USER"
-newgrp video  # or open a new terminal afterwards
-```
-
-## Attach the camera from Windows
-
-Run these commands in an **elevated PowerShell** on the host:
+Open PowerShell or Command Prompt in the project folder:
 
 ```powershell
-# 1. Find the bus ID
-usbipd list
-
-# 2. Bind (admin only, once per boot)
-usbipd bind --busid <BUS-ID>
-
-# 3. Attach to WSL2 (re-run after every USB reconnect)
-usbipd attach --wsl --busid <BUS-ID>
+py -m venv .venv
+.\.venv\Scripts\activate
+pip install --upgrade pip
+pip install -r requirements.txt
 ```
 
-Confirm the device is visible in WSL:
+## List devices
 
-```bash
-lsusb
-# Bus 001 Device 002: ID 058f:3822 Alcor Micro Corp. MikrOkularHD
-
-ls -l /dev/video*
-# /dev/video0, /dev/video1, /dev/media0
+```powershell
+python microscope_viewer.py --list-devices
 ```
 
-If `/dev/video*` does not appear, ensure modules are loaded:
+Example output:
 
-```bash
-sudo modprobe vhci-hcd   # provides the USB/IP host controller
-sudo modprobe uvcvideo   # USB Video Class driver
+```
+[0] MikrOkularHD
+[1] USB Camera
 ```
 
 ## Run the viewer
 
-```bash
-. .venv/bin/activate
+```powershell
 python microscope_viewer.py
 ```
 
 Useful options:
 
-- `--device /dev/video1` - manually point to the camera if auto-detection fails.
+- `--device 0` - use a specific camera index.
+- `--device "MikrOkularHD"` - select by name substring (use `--list-devices`).
 - `--width 1280 --height 720 --fps 30` - request a specific capture mode.
 - `--window-title "Microscope"` - change the preview window caption.
 - `--window-width 1280 --window-height 720` - override the preview window size.
-- `--window-x 50 --window-y 50` - force a specific window position if WSLg spawns off-screen.
-- `--display-backend opencv` - fall back to OpenCV's native window; `pygame` is default.
+- `--display-backend opencv` - fall back to OpenCV's native window; pygame is default.
+- `--capture-backend dshow` - force DirectShow (use `msmf` if dshow misbehaves).
+- `--capture-backend pygrabber` - use DirectShow via pygrabber if OpenCV backends fail.
 - `--fourcc MJPG --fallback-fourcc YUYV` - control pixel formats (`--fourcc auto` to skip forcing).
 - `--max-empty 120 --max-reconnects 10` - adjust the watchdog reconnect behavior.
-- `--buffer-count 4` - request a specific V4L buffer queue depth.
+- `--buffer-count 4` - request a specific capture buffer depth.
 
 Quit the preview with `q` or `Esc`.
 
@@ -93,9 +70,8 @@ Quit the preview with `q` or `Esc`.
 
 Capture raw frames for debugging or offline processing:
 
-```bash
-. .venv/bin/activate
-python microscope_raw_dump.py --frames 10 --output frame.raw --metadata frame.json
+```powershell
+python microscope_raw_dump.py --device 0 --frames 10 --output frame.raw --metadata frame.json
 ```
 
 Use `--output -` to stream the raw bytes to stdout.
@@ -104,18 +80,19 @@ Use `--output -` to stream the raw bytes to stdout.
 
 | Symptom | Fix |
 | --- | --- |
-| `ls: cannot access '/dev/video*'` | Reattach the device (`usbipd attach ...`) and reload `vhci-hcd`. |
-| `Failed to open the camera` | The device is still owned by Windows or another app. Stop any Windows capture software and reattach. |
-| `Permission denied` on `/dev/video0` | Ensure your WSL user is in the `video` group and reopen the shell. |
-| Window never appears | Confirm WSLg is running (on Windows 11) or that an X server is configured (`echo $DISPLAY`). |
-| Window icon shows but no content | Use the default `pygame` backend and ensure `QT_QPA_PLATFORM=xcb` / `SDL_VIDEODRIVER=x11` are set for OpenCV windows. |
-| `Corrupt JPEG data` spam / timeouts | Switch formats with `--fourcc MJPG --fallback-fourcc YUYV` or reduce resolution. |
+| No devices listed | Close other camera apps, confirm the microscope appears in Device Manager, then retry `--list-devices`. |
+| `Failed to open the camera` | Try `--device 0` or a different index, switch backends with `--capture-backend dshow` / `msmf`, or use `--capture-backend pygrabber`. |
+| `backend ... can't be used to capture by index` | Use `--device "MikrOkularHD"` (name substring) or `--capture-backend pygrabber`. |
+| Black or frozen preview | Switch pixel formats with `--fourcc MJPG --fallback-fourcc YUYV` and reduce resolution. |
+| High latency | Prefer `--capture-backend dshow` and reduce resolution/FPS. |
 
 ## Project layout
 
-- `microscope_viewer.py` - interactive viewer that locates `/dev/video*`, configures capture settings, and renders frames.
-- `microscope_raw_dump.py` - non-interactive CLI that dumps raw frames (YUYV/MJPG) plus optional JSON metadata.
-- `docs/screenshot.svg` - illustrative preview image.
+- `microscope_viewer.py` - interactive viewer that configures capture settings and renders frames.
+- `microscope_raw_dump.py` - non-interactive CLI that dumps raw frames plus optional JSON metadata.
+- `microscope_devices.py` - device enumeration helpers.
+- `microscope_capture.py` - capture helpers with a DirectShow fallback for Windows.
+- `docs/screenshot.png` - illustrative preview image.
 
 ## License
 

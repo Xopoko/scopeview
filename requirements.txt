@@ -1,2 +1,4 @@
 opencv-python>=4.8
 pygame>=2.5
+pygrabber>=0.2
+comtypes>=1.2
